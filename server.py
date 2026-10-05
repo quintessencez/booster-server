@@ -698,4 +698,32 @@ def admin_add_key(key: str, role: str = "booster", note: str = "",
 def admin_toggle_key(key: str, _=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
     cur.execute("SELECT active FROM keys WHERE key = %s", (key,))
-    row
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Ключ не найден")
+    new_val = not row["active"]
+    cur.execute("UPDATE keys SET active = %s WHERE key = %s", (new_val, key))
+    conn.commit()
+    return {"ok": True, "active": new_val}
+
+
+@app.get("/api/admin/top")
+def admin_top(_=Depends(require_admin), conn=Depends(get_db)):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.id, u.nickname, COALESCE(SUM(t.amount), 0) as earned
+        FROM users u LEFT JOIN transactions t ON t.user_id = u.id AND t.type = 'earning'
+        WHERE u.role = 'booster' GROUP BY u.id ORDER BY earned DESC LIMIT 5
+    """)
+    return cur.fetchall()
+
+
+@app.get("/api/admin/daily")
+def admin_daily(days: int = 7, _=Depends(require_admin), conn=Depends(get_db)):
+    cur = conn.cursor()
+    result = []
+    for i in range(days - 1, -1, -1):
+        d = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
+        cur.execute("SELECT COALESCE(SUM(amount), 0) as s FROM transactions WHERE type='commission' AND date(date)=%s", (d,))
+        result.append({"date": d, "amount": float(cur.fetchone()["s"] or 0)})
+    return result
