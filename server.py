@@ -727,3 +727,80 @@ def admin_active_boosts(_=Depends(require_admin), conn=Depends(get_db)):
                    WHERE b.status IN ('planned','active')
                    ORDER BY b.id DESC""")
     return rows_to_json(cur.fetchall())
+
+# ==================== ДОП. АДМИН-ЭНДПОИНТЫ ====================
+
+@app.get("/api/boosts/detail/{boost_id}")
+def get_boost_detail(boost_id: int, x_user_id: int = Header(...), conn=Depends(get_db)):
+    """Детальная инфа по одному заказу + кто работает + история."""
+    cur = conn.cursor()
+    cur.execute("""SELECT b.*, u.nickname AS booster_nickname, u.id AS booster_user_id
+                   FROM boosts b JOIN users u ON u.id = b.booster_id
+                   WHERE b.id = %s""", (boost_id,))
+    b = cur.fetchone()
+    if not b:
+        raise HTTPException(404, "Заказ не найден")
+
+    # права: только сам бустер или админ
+    cur.execute("SELECT role FROM users WHERE id = %s", (x_user_id,))
+    me = cur.fetchone()
+    is_admin = bool(me and me["role"] == "admin")
+    if not is_admin and b["booster_id"] != x_user_id:
+        raise HTTPException(403, "Нет доступа")
+
+    # транзакции по заказу
+    cur.execute("""SELECT * FROM transactions WHERE boost_id = %s
+                   ORDER BY id DESC""", (boost_id,))
+    txs = rows_to_json(cur.fetchall())
+
+    result = dict(b)
+    for k, v in result.items():
+        if isinstance(v, datetime.datetime):
+            result[k] = v.isoformat()
+    result["transactions"] = txs
+    return result
+
+
+@app.get("/api/admin/boosters-stats")
+def admin_boosters_stats(_=Depends(require_admin), conn=Depends(get_db)):
+    """Сводка по каждому бустеру + админ."""
+    cur = conn.cursor()
+    cur.execute("""SELECT id, nickname, role, balance, hourly_rate, last_login
+                   FROM users ORDER BY role DESC, id ASC""")
+    users = cur.fetchall()
+    out = []
+    for u in users:
+        cur.execute("""SELECT
+            COUNT(*) FILTER (WHERE status='planned')   AS planned,
+            COUNT(*) FILTER (WHERE status='active')    AS active,
+            COUNT(*) FILTER (WHERE status='completed') AS completed,
+            COUNT(*) FILTER (WHERE status='refunded')  AS refunded,
+            COALESCE(SUM(booster_earn) FILTER (WHERE status='completed'), 0) AS earned,
+            COALESCE(AVG(booster_earn) FILTER (WHERE status='completed'), 0) AS avg_check,
+            COALESCE(SUM(estimated_hours) FILTER (WHERE status='completed'), 0) AS hours
+            FROM boosts WHERE booster_id = %s""", (u["id"],))
+        s = cur.fetchone()
+        hours = float(s["hours"] or 0)
+        earned = float(s["earned"] or 0)
+        cur.execute("""SELECT COALESCE(SUM(amount), 0) AS commission
+                       FROM transactions WHERE user_id = %s AND type = 'commission'""",
+                    (u["id"],))
+        comm = float(cur.fetchone()["commission"] or 0)
+        out.append({
+            "id": u["id"],
+            "nickname": u["nickname"],
+            "role": u["role"],
+            "balance": float(u["balance"] or 0),
+            "hourly_rate": u["hourly_rate"],
+            "last_login": u["last_login"],
+            "planned": s["planned"],
+            "active": s["active"],
+            "completed": s["completed"],
+            "refunded": s["refunded"],
+            "earned": earned,
+            "avg_check": float(s["avg_check"] or 0),
+            "hours": hours,
+            "avg_hourly": (earned / hours) if hours else 0,
+            "commission": comm,
+        })
+    return out
