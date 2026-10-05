@@ -1,5 +1,5 @@
 # server.py
-"""Booster Platform API v3 — с быстрым анализом клиентов."""
+"""Booster Platform API v4 — Neon + Render ready."""
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
@@ -11,15 +11,18 @@ import datetime
 import httpx
 import asyncio
 import json
+import re
 
-app = FastAPI(title="Valve Games Booster API v3")
+app = FastAPI(title="Valve Games Booster API v4")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL не задан")
 
-ADMIN_KEY = "TEST-KEY-FOR-ME-0001"
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "TEST-KEY-FOR-ME-0001")
+FACEIT_API_KEY = os.environ.get("FACEIT_API_KEY", "")
 OPENDOTA_BASE = "https://api.opendota.com/api"
+FACEIT_BASE = "https://open.faceit.com/data/v4"
 
 
 def get_db():
@@ -30,8 +33,8 @@ def get_db():
         conn.close()
 
 
-def get_hwid_hash(hwid):
-    return hashlib.sha256(hwid.encode()).hexdigest()[:32]
+def get_hwid_hash(hwid: str, key: str) -> str:
+    return hashlib.sha256(f"{key}:{hwid}".encode()).hexdigest()[:32]
 
 
 def rows_to_json(rows):
@@ -45,6 +48,7 @@ def rows_to_json(rows):
     return result
 
 
+# ==================== МОДЕЛИ ====================
 class LoginRequest(BaseModel):
     key: str
     nickname: str | None = None
@@ -72,15 +76,22 @@ class BalanceAdjust(BaseModel):
     comment: str = "Ручная корректировка"
 
 
+class TransferBoost(BaseModel):
+    boost_id: int
+    to_user_id: int
+    comment: str = ""
+
+
 class ChatMessage(BaseModel):
     to_user_id: int | None = None
     boost_id: int | None = None
     message: str
 
 
+# ==================== БАЗОВЫЕ ====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Booster API v3"}
+    return {"status": "ok", "service": "Booster API v4"}
 
 
 @app.post("/api/login")
@@ -90,26 +101,39 @@ def login(req: LoginRequest, conn=Depends(get_db)):
     key_row = cur.fetchone()
     if not key_row or not key_row["active"]:
         raise HTTPException(401, "Ключ не найден или деактивирован")
+
     role = key_row["role"]
-    hwid_hash = get_hwid_hash(req.hwid)
+    hwid_hash = get_hwid_hash(req.hwid, req.key.upper())
+
     cur.execute("SELECT * FROM users WHERE key = %s", (req.key.upper(),))
     user = cur.fetchone()
+
     if user:
+        # ключ уже привязан к этому устройству?
         if user["hwid"] != hwid_hash:
             raise HTTPException(403, "Ключ привязан к другому устройству")
+        # ник привязан к ключу — менять нельзя
+        if req.nickname and req.nickname != user["nickname"]:
+            raise HTTPException(403, "Ник привязан к ключу и не может быть изменён")
         cur.execute("UPDATE users SET last_login = %s WHERE id = %s",
                     (datetime.datetime.now().isoformat(), user["id"]))
         conn.commit()
         return {"id": user["id"], "key": user["key"], "nickname": user["nickname"],
                 "role": user["role"], "hourly_rate": user["hourly_rate"],
                 "balance": float(user["balance"] or 0)}
-    if not req.nickname or len(req.nickname) < 3:
+
+    # первый вход — создаём
+    if not req.nickname or len(req.nickname.strip()) < 3:
         raise HTTPException(400, "Ник минимум 3 символа")
-    cur.execute("SELECT id FROM users WHERE nickname = %s", (req.nickname,))
+    nick = req.nickname.strip()
+    cur.execute("SELECT id FROM users WHERE nickname = %s", (nick,))
     if cur.fetchone():
         raise HTTPException(400, "Ник занят")
-    cur.execute("INSERT INTO users (key, nickname, role, hwid, last_login) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (req.key.upper(), req.nickname, role, hwid_hash, datetime.datetime.now().isoformat()))
+
+    cur.execute("""INSERT INTO users (key, nickname, role, hwid, last_login)
+                   VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+                (req.key.upper(), nick, role, hwid_hash,
+                 datetime.datetime.now().isoformat()))
     uid = cur.fetchone()["id"]
     conn.commit()
     cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
@@ -119,14 +143,31 @@ def login(req: LoginRequest, conn=Depends(get_db)):
             "balance": float(user["balance"] or 0)}
 
 
+# ==================== БУСТЫ ====================
 @app.get("/api/boosts/{user_id}")
 def get_boosts(user_id: int, status: str = "all", conn=Depends(get_db)):
+    """Для бустера — только свои. Для админа — все."""
     cur = conn.cursor()
-    if status == "all":
-        cur.execute("SELECT * FROM boosts WHERE booster_id = %s ORDER BY id DESC", (user_id,))
+    cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    is_admin = bool(row and row["role"] == "admin")
+
+    if is_admin:
+        if status == "all":
+            cur.execute("""SELECT b.*, u.nickname AS booster_nickname
+                           FROM boosts b JOIN users u ON u.id = b.booster_id
+                           ORDER BY b.id DESC""")
+        else:
+            cur.execute("""SELECT b.*, u.nickname AS booster_nickname
+                           FROM boosts b JOIN users u ON u.id = b.booster_id
+                           WHERE b.status = %s ORDER BY b.id DESC""", (status,))
     else:
-        cur.execute("SELECT * FROM boosts WHERE booster_id = %s AND status = %s ORDER BY id DESC",
-                    (user_id, status))
+        if status == "all":
+            cur.execute("SELECT * FROM boosts WHERE booster_id = %s ORDER BY id DESC",
+                        (user_id,))
+        else:
+            cur.execute("SELECT * FROM boosts WHERE booster_id = %s AND status = %s ORDER BY id DESC",
+                        (user_id, status))
     return rows_to_json(cur.fetchall())
 
 
@@ -146,7 +187,8 @@ def create_boost(boost: BoostCreate, x_user_id: int = Header(...), conn=Depends(
     cur.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
     admin = cur.fetchone()
     if admin:
-        cur.execute("INSERT INTO notifications (user_id, type, title, body, related_id) VALUES (%s, %s, %s, %s, %s)",
+        cur.execute("""INSERT INTO notifications (user_id, type, title, body, related_id)
+                       VALUES (%s, %s, %s, %s, %s)""",
                     (admin["id"], "new_boost", f"Новый заказ #{bid}",
                      f"Игра: {boost.game}, цена: {boost.total_price} ₽", bid))
         conn.commit()
@@ -171,14 +213,19 @@ def complete_boost(boost_id: int, conn=Depends(get_db)):
         raise HTTPException(404, "Заказ не найден")
     now = datetime.datetime.now().isoformat()
     cur.execute("UPDATE boosts SET status = 'completed', completed_at = %s WHERE id = %s", (now, boost_id))
-    cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s", (row["booster_earn"], row["booster_id"]))
-    cur.execute("INSERT INTO transactions (user_id, boost_id, amount, type, comment) VALUES (%s, %s, %s, %s, %s)",
-                (row["booster_id"], boost_id, row["booster_earn"], "earning", f"Завершён буст #{boost_id}"))
+    cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s",
+                (row["booster_earn"], row["booster_id"]))
+    cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (row["booster_id"], boost_id, row["booster_earn"], "earning",
+                 f"Завершён буст #{boost_id}"))
     cur.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
     admin = cur.fetchone()
     if admin and row["commission"] > 0:
-        cur.execute("INSERT INTO transactions (user_id, boost_id, amount, type, comment) VALUES (%s, %s, %s, %s, %s)",
-                    (admin["id"], boost_id, row["commission"], "commission", f"Комиссия с буста #{boost_id}"))
+        cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (admin["id"], boost_id, row["commission"], "commission",
+                     f"Комиссия с буста #{boost_id}"))
     conn.commit()
     return {"ok": True}
 
@@ -192,6 +239,40 @@ def refund_boost(boost_id: int, conn=Depends(get_db)):
     return {"ok": True}
 
 
+@app.post("/api/boosts/transfer")
+def transfer_boost(req: TransferBoost, x_user_id: int = Header(...), conn=Depends(get_db)):
+    cur = conn.cursor()
+    cur.execute("SELECT booster_id, status FROM boosts WHERE id = %s", (req.boost_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Заказ не найден")
+    if row["status"] in ("completed", "refunded"):
+        raise HTTPException(400, "Нельзя передать закрытый заказ")
+
+    cur.execute("SELECT role, nickname FROM users WHERE id = %s", (x_user_id,))
+    me = cur.fetchone()
+    is_admin = bool(me and me["role"] == "admin")
+
+    if not is_admin and row["booster_id"] != x_user_id:
+        raise HTTPException(403, "Можно передавать только свои заказы")
+
+    cur.execute("SELECT nickname FROM users WHERE id = %s", (req.to_user_id,))
+    target = cur.fetchone()
+    if not target:
+        raise HTTPException(404, "Получатель не найден")
+
+    cur.execute("UPDATE boosts SET booster_id = %s WHERE id = %s",
+                (req.to_user_id, req.boost_id))
+    cur.execute("""INSERT INTO notifications (user_id, type, title, body, related_id)
+                   VALUES (%s, 'transfer', 'Вам передан заказ', %s, %s)""",
+                (req.to_user_id,
+                 f"Заказ #{req.boost_id} передан от {me['nickname']}",
+                 req.boost_id))
+    conn.commit()
+    return {"ok": True}
+
+
+# ==================== ПРОФИЛЬ ====================
 @app.get("/api/profile/{user_id}")
 def get_profile(user_id: int, conn=Depends(get_db)):
     cur = conn.cursor()
@@ -199,6 +280,7 @@ def get_profile(user_id: int, conn=Depends(get_db)):
     user = cur.fetchone()
     if not user:
         raise HTTPException(404, "Пользователь не найден")
+
     cur.execute("""SELECT
         COALESCE(SUM(CASE WHEN status='planned' THEN 1 END), 0) as planned,
         COALESCE(SUM(CASE WHEN status='active' THEN 1 END), 0) as active,
@@ -206,11 +288,14 @@ def get_profile(user_id: int, conn=Depends(get_db)):
         COALESCE(SUM(CASE WHEN status='refunded' THEN 1 END), 0) as refunded
         FROM boosts WHERE booster_id = %s""", (user_id,))
     counts = cur.fetchone()
+
     cur.execute("SELECT COALESCE(SUM(amount), 0) as earned FROM transactions WHERE user_id = %s AND type = 'earning'", (user_id,))
     total_earned = cur.fetchone()["earned"]
+
     today = datetime.date.today().isoformat()
     week_ago = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
     month_ago = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+
     cur.execute("""SELECT
         COALESCE(SUM(CASE WHEN date(date) = %s THEN amount END), 0) as today,
         COALESCE(SUM(CASE WHEN date(date) >= %s THEN amount END), 0) as week,
@@ -218,26 +303,32 @@ def get_profile(user_id: int, conn=Depends(get_db)):
         FROM transactions WHERE user_id = %s AND type = 'earning'""",
         (today, week_ago, month_ago, user_id))
     periods = cur.fetchone()
+
     cur.execute("""SELECT COALESCE(AVG(booster_earn), 0) as avg_check,
                    COALESCE(SUM(estimated_hours), 0) as total_hours,
                    COUNT(*) as completed_count
                    FROM boosts WHERE booster_id = %s AND status = 'completed'""", (user_id,))
     agg = cur.fetchone()
     avg_hourly = (total_earned / agg["total_hours"]) if agg["total_hours"] else 0
+
     cur.execute("SELECT game, COUNT(*) as c FROM boosts WHERE booster_id = %s GROUP BY game ORDER BY c DESC LIMIT 1", (user_id,))
     fav = cur.fetchone()
     favorite_game = fav["game"] if fav else "—"
+
     cur.execute("SELECT * FROM transactions WHERE user_id = %s ORDER BY id DESC LIMIT 30", (user_id,))
     history = cur.fetchall()
     for h in history:
         if isinstance(h["date"], datetime.datetime):
             h["date"] = h["date"].isoformat()
+
     daily = []
     for i in range(13, -1, -1):
         d = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
-        cur.execute("SELECT COALESCE(SUM(amount), 0) as s FROM transactions WHERE user_id = %s AND type = 'earning' AND date(date) = %s",
-                    (user_id, d))
+        cur.execute("""SELECT COALESCE(SUM(amount), 0) as s
+                       FROM transactions WHERE user_id = %s AND type = 'earning'
+                       AND date(date) = %s""", (user_id, d))
         daily.append({"date": d, "amount": float(cur.fetchone()["s"] or 0)})
+
     return {"user": {"id": user["id"], "key": user["key"], "nickname": user["nickname"],
                      "role": user["role"], "balance": float(user["balance"] or 0),
                      "hourly_rate": user["hourly_rate"]},
@@ -264,6 +355,7 @@ def update_rate(user_id: int = Header(...), rate: int = Header(...), conn=Depend
     return {"ok": True}
 
 
+# ==================== ЧАТ ====================
 @app.get("/api/chat/{user_id}")
 def get_chat(user_id: int, with_user: int = 0, conn=Depends(get_db)):
     cur = conn.cursor()
@@ -279,7 +371,8 @@ def get_chat(user_id: int, with_user: int = 0, conn=Depends(get_db)):
                        ORDER BY cm.id ASC LIMIT 200""",
                     (user_id, with_user, with_user, user_id))
     rows = cur.fetchall()
-    cur.execute("UPDATE chat_messages SET is_read = 1 WHERE to_user_id = %s AND is_read = 0", (user_id,))
+    cur.execute("UPDATE chat_messages SET is_read = 1 WHERE to_user_id = %s AND is_read = 0",
+                (user_id,))
     conn.commit()
     return rows_to_json(rows)
 
@@ -287,25 +380,30 @@ def get_chat(user_id: int, with_user: int = 0, conn=Depends(get_db)):
 @app.post("/api/chat")
 def send_chat(msg: ChatMessage, x_user_id: int = Header(...), conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("INSERT INTO chat_messages (from_user_id, to_user_id, boost_id, message) VALUES (%s, %s, %s, %s) RETURNING id",
+    cur.execute("""INSERT INTO chat_messages (from_user_id, to_user_id, boost_id, message)
+                   VALUES (%s, %s, %s, %s) RETURNING id""",
                 (x_user_id, msg.to_user_id, msg.boost_id, msg.message))
     mid = cur.fetchone()["id"]
     if msg.to_user_id:
-        cur.execute("INSERT INTO notifications (user_id, type, title, body, related_id) VALUES (%s, %s, %s, %s, %s)",
+        cur.execute("""INSERT INTO notifications (user_id, type, title, body, related_id)
+                       VALUES (%s, %s, %s, %s, %s)""",
                     (msg.to_user_id, "chat", "Новое сообщение", msg.message[:100], mid))
     else:
         cur.execute("SELECT id FROM users WHERE id != %s", (x_user_id,))
         for u in cur.fetchall():
-            cur.execute("INSERT INTO notifications (user_id, type, title, body, related_id) VALUES (%s, %s, %s, %s, %s)",
+            cur.execute("""INSERT INTO notifications (user_id, type, title, body, related_id)
+                           VALUES (%s, %s, %s, %s, %s)""",
                         (u["id"], "chat", "Новое сообщение в чате", msg.message[:100], mid))
     conn.commit()
     return {"id": mid}
 
 
+# ==================== УВЕДОМЛЕНИЯ ====================
 @app.get("/api/notifications/{user_id}")
 def get_notifications(user_id: int, conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("SELECT * FROM notifications WHERE user_id = %s ORDER BY id DESC LIMIT 50", (user_id,))
+    cur.execute("SELECT * FROM notifications WHERE user_id = %s ORDER BY id DESC LIMIT 50",
+                (user_id,))
     return rows_to_json(cur.fetchall())
 
 
@@ -320,19 +418,50 @@ def mark_all_read(user_id: int, conn=Depends(get_db)):
 @app.get("/api/notifications/unread/{user_id}")
 def unread_count(user_id: int, conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as c FROM notifications WHERE user_id = %s AND is_read = 0", (user_id,))
+    cur.execute("SELECT COUNT(*) as c FROM notifications WHERE user_id = %s AND is_read = 0",
+                (user_id,))
     return {"count": cur.fetchone()["c"]}
 
 
-# ==================== БЫСТРЫЙ АНАЛИЗ КЛИЕНТА (ПАРАЛЛЕЛЬНЫЙ) ====================
-@app.get("/api/client/analyze/{steam32}")
-async def analyze_client(steam32: str, conn=Depends(get_db)):
-    """
-    Быстрый анализ клиента: 4 запроса параллельно + кэш на 30 минут.
-    """
+# ==================== АНАЛИЗ КЛИЕНТА (DOTA) ====================
+def _get_cache(steam32, conn):
     cur = conn.cursor()
     cur.execute("SELECT * FROM client_cache WHERE steam32_id = %s", (steam32,))
-    cached = cur.fetchone()
+    return cur.fetchone()
+
+
+def _save_cache(steam32, nick, rank_tier, lb, wr, total, age_days,
+                top_heroes, score, signals, conn):
+    cur = conn.cursor()
+    cur.execute("""INSERT INTO client_cache (steam32_id, nickname, rank_tier, leaderboard_rank,
+                    winrate, total_games, account_age_days, top_heroes, smurf_score,
+                    smurf_signals, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (steam32_id) DO UPDATE SET
+                    nickname = EXCLUDED.nickname, rank_tier = EXCLUDED.rank_tier,
+                    leaderboard_rank = EXCLUDED.leaderboard_rank, winrate = EXCLUDED.winrate,
+                    total_games = EXCLUDED.total_games, account_age_days = EXCLUDED.account_age_days,
+                    top_heroes = EXCLUDED.top_heroes, smurf_score = EXCLUDED.smurf_score,
+                    smurf_signals = EXCLUDED.smurf_signals, updated_at = EXCLUDED.updated_at""",
+                (steam32, nick, rank_tier, lb, wr, total, age_days,
+                 json.dumps(top_heroes), score, json.dumps(signals),
+                 datetime.datetime.now()))
+    conn.commit()
+
+
+async def _http_get(url, timeout=6):
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(url)
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
+
+async def _analyze_dota_internal(steam32, conn):
+    # 1) кэш
+    cached = _get_cache(steam32, conn)
     if cached:
         age = (datetime.datetime.now() - cached["updated_at"]).total_seconds()
         if age < 1800:
@@ -344,50 +473,30 @@ async def analyze_client(steam32: str, conn=Depends(get_db)):
             result["from_cache"] = True
             return result
 
-    # Параллельные запросы
-    async def get(url):
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(url)
-                if r.status_code == 200:
-                    return r.json()
-        except Exception:
-            pass
-        return None
-
-    profile, heroes, wl, recent, first = await asyncio.gather(
-        get(f"{OPENDOTA_BASE}/players/{steam32}"),
-        get(f"{OPENDOTA_BASE}/players/{steam32}/heroes"),
-        get(f"{OPENDOTA_BASE}/players/{steam32}/wl"),
-        get(f"{OPENDOTA_BASE}/players/{steam32}/recentMatches"),
-        get(f"{OPENDOTA_BASE}/players/{steam32}/matches?limit=1&sort=asc"),
-        return_exceptions=True,
+    # 2) три параллельных запроса вместо пяти
+    profile, recent, first = await asyncio.gather(
+        _http_get(f"{OPENDOTA_BASE}/players/{steam32}"),
+        _http_get(f"{OPENDOTA_BASE}/players/{steam32}/recentMatches"),
+        _http_get(f"{OPENDOTA_BASE}/players/{steam32}/matches?limit=1&sort=asc"),
     )
 
-    if not profile or isinstance(profile, Exception):
-        raise HTTPException(404, "Не удалось получить профиль")
+    if not profile:
+        raise HTTPException(404, "Профиль не найден в OpenDota")
 
     nick = profile.get("profile", {}).get("personaname", "—")
     rank_tier = profile.get("rank_tier")
     lb = profile.get("leaderboard_rank")
-    wins = (wl or {}).get("win", 0) if wl and not isinstance(wl, Exception) else 0
-    losses = (wl or {}).get("lose", 0) if wl and not isinstance(wl, Exception) else 0
+    wins = profile.get("win", 0) or 0
+    losses = profile.get("lose", 0) or 0
     total = wins + losses
     wr = (wins / total) if total else 0
 
-    top_heroes = []
-    if heroes and not isinstance(heroes, Exception):
-        sorted_h = sorted(heroes, key=lambda x: x.get("games", 0), reverse=True)[:5]
-        for h in sorted_h:
-            top_heroes.append({"hero_id": h.get("hero_id"),
-                                "games": h.get("games", 0),
-                                "wins": h.get("win", 0)})
-
     age_days = None
-    if first and not isinstance(first, Exception) and len(first) > 0:
+    if first and isinstance(first, list) and first:
         st = first[0].get("start_time")
         if st:
-            age_days = (datetime.datetime.now() - datetime.datetime.fromtimestamp(st)).days
+            age_days = (datetime.datetime.now() -
+                        datetime.datetime.fromtimestamp(st)).days
 
     score = 0
     signals = []
@@ -396,17 +505,19 @@ async def analyze_client(steam32: str, conn=Depends(get_db)):
     elif age_days is not None and age_days < 365:
         score += 15; signals.append(f"Аккаунт до года: {age_days} дней")
 
-    recent_wr = 0
-    if recent and not isinstance(recent, Exception) and recent:
+    if recent and isinstance(recent, list) and recent:
         rw = 0
-        for m in recent[:50]:
+        n = min(len(recent), 50)
+        for m in recent[:n]:
             slot = m.get("player_slot", 0)
             is_rad = slot < 128
             radiant_win = m.get("radiant_win")
-            if radiant_win is None: continue
+            if radiant_win is None:
+                continue
             won = (radiant_win and is_rad) or (not radiant_win and not is_rad)
-            if won: rw += 1
-        recent_wr = rw / min(len(recent), 50)
+            if won:
+                rw += 1
+        recent_wr = rw / n if n else 0
         if recent_wr > 0.70:
             score += 30; signals.append(f"Винрейт последних игр: {recent_wr*100:.0f}%")
         elif recent_wr > 0.60:
@@ -419,32 +530,73 @@ async def analyze_client(steam32: str, conn=Depends(get_db)):
 
     score = min(100, score)
 
-    cur.execute("""INSERT INTO client_cache (steam32_id, nickname, rank_tier, leaderboard_rank,
-                    winrate, total_games, account_age_days, top_heroes, smurf_score,
-                    smurf_signals, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (steam32_id) DO UPDATE SET
-                    nickname = EXCLUDED.nickname, rank_tier = EXCLUDED.rank_tier,
-                    leaderboard_rank = EXCLUDED.leaderboard_rank, winrate = EXCLUDED.winrate,
-                    total_games = EXCLUDED.total_games, account_age_days = EXCLUDED.account_age_days,
-                    top_heroes = EXCLUDED.top_heroes, smurf_score = EXCLUDED.smurf_score,
-                    smurf_signals = EXCLUDED.smurf_signals, updated_at = EXCLUDED.updated_at""",
-                (steam32, nick, rank_tier, lb, wr, total, age_days,
-                 json.dumps(top_heroes), score, json.dumps(signals), datetime.datetime.now()))
-    conn.commit()
+    _save_cache(steam32, nick, rank_tier, lb, wr, total, age_days,
+                [], score, signals, conn)
+
     return {"steam32_id": steam32, "nickname": nick, "rank_tier": rank_tier,
             "leaderboard_rank": lb, "winrate": wr, "total_games": total,
-            "account_age_days": age_days, "top_heroes": top_heroes,
+            "account_age_days": age_days, "top_heroes": [],
             "smurf_score": score, "smurf_signals": signals, "from_cache": False}
+
+
+@app.get("/api/client/analyze/{steam32}")
+async def analyze_client(steam32: str, conn=Depends(get_db)):
+    try:
+        return await asyncio.wait_for(_analyze_dota_internal(steam32, conn), timeout=8.0)
+    except asyncio.TimeoutError:
+        return {"error": "OpenDota не ответил за 8 секунд"}
+
+
+# ==================== АНАЛИЗ КЛИЕНТА (CS2 / FACEIT) ====================
+@app.get("/api/client/analyze-cs2/{steam_id}")
+async def analyze_cs2(steam_id: str):
+    """Анализ CS2 через FACEIT Data API v4."""
+    if not FACEIT_API_KEY:
+        return {"error": "FACEIT_API_KEY не настроен"}
+    headers = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(f"{FACEIT_BASE}/players",
+                            params={"game": "cs2", "game_player_id": steam_id},
+                            headers=headers)
+            if r.status_code != 200:
+                return {"error": "Не удалось найти игрока на FACEIT"}
+            player = r.json()
+            pid = player.get("player_id")
+            if not pid:
+                return {"error": "Не удалось найти игрока на FACEIT"}
+
+            stats_r = await c.get(f"{FACEIT_BASE}/players/{pid}/stats/cs2",
+                                  headers=headers)
+            stats = stats_r.json() if stats_r.status_code == 200 else {}
+
+        games = player.get("games", {}).get("cs2", {})
+        life = stats.get("lifetime", {}) if stats else {}
+        return {
+            "steam_id": steam_id,
+            "player_id": pid,
+            "nickname": player.get("nickname", "—"),
+            "country": player.get("country", "—"),
+            "level": games.get("skill_level"),
+            "elo": games.get("faceit_elo"),
+            "kd": life.get("Average K/D Ratio"),
+            "hs": life.get("Average Headshots %"),
+            "winrate": life.get("Win Rate %"),
+            "matches": life.get("Matches"),
+            "longest_win_streak": life.get("Longest Win Streak"),
+        }
+    except Exception as e:
+        return {"error": f"FACEIT недоступен: {e}"}
 
 
 @app.get("/api/client/trust/{steam_id}")
 async def check_trust(steam_id: str):
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(f"https://faceitfinder.com/profile/{steam_id}", follow_redirects=True)
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(f"https://faceitfinder.com/profile/{steam_id}",
+                            follow_redirects=True)
         if r.status_code != 200:
             return {"trust_factor": None, "error": "Нет данных"}
-        import re
         m = re.search(r"Trust\s*Factor[:\s]*(\d+)", r.text, re.IGNORECASE)
         if m:
             tf = int(m.group(1))
@@ -455,6 +607,7 @@ async def check_trust(steam_id: str):
         return {"trust_factor": None, "error": str(e)}
 
 
+# ==================== АДМИН ====================
 def require_admin(x_admin_key: str = Header(...)):
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(403, "Доступ запрещён")
@@ -463,7 +616,10 @@ def require_admin(x_admin_key: str = Header(...)):
 @app.get("/api/admin/stats")
 def admin_stats(_=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("SELECT COALESCE(SUM(total_price),0) as turnover, COALESCE(SUM(commission),0) as commission, COALESCE(SUM(booster_earn),0) as paid FROM boosts WHERE status = 'completed'")
+    cur.execute("""SELECT COALESCE(SUM(total_price),0) as turnover,
+                          COALESCE(SUM(commission),0) as commission,
+                          COALESCE(SUM(booster_earn),0) as paid
+                   FROM boosts WHERE status = 'completed'""")
     fin = cur.fetchone()
     cur.execute("""SELECT
         COALESCE(SUM(CASE WHEN status='planned' THEN 1 END), 0) as planned,
@@ -484,28 +640,37 @@ def admin_stats(_=Depends(require_admin), conn=Depends(get_db)):
     boosters = cur.fetchone()["c"]
     cur.execute("SELECT COALESCE(SUM(balance),0) as b FROM users WHERE role = 'booster'")
     total_balance = cur.fetchone()["b"]
-    return {"turnover": float(fin["turnover"] or 0), "commission": float(fin["commission"] or 0),
-            "paid": float(fin["paid"] or 0), "counts": counts,
-            "c_today": float(periods["today"] or 0), "c_week": float(periods["week"] or 0),
+    return {"turnover": float(fin["turnover"] or 0),
+            "commission": float(fin["commission"] or 0),
+            "paid": float(fin["paid"] or 0),
+            "counts": counts,
+            "c_today": float(periods["today"] or 0),
+            "c_week": float(periods["week"] or 0),
             "c_month": float(periods["month"] or 0),
-            "boosters": boosters, "total_balance": float(total_balance or 0)}
+            "boosters": boosters,
+            "total_balance": float(total_balance or 0)}
 
 
 @app.get("/api/admin/users")
 def admin_users(_=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("SELECT id, key, nickname, role, balance, hourly_rate, created_at, last_login FROM users ORDER BY id")
+    cur.execute("""SELECT id, key, nickname, role, balance, hourly_rate,
+                          created_at, last_login FROM users ORDER BY id""")
     return rows_to_json(cur.fetchall())
 
 
 @app.post("/api/admin/balance")
 def admin_balance(req: BalanceAdjust, _=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s", (req.delta, req.user_id))
-    cur.execute("INSERT INTO transactions (user_id, amount, type, comment) VALUES (%s, %s, %s, %s)",
+    cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s",
+                (req.delta, req.user_id))
+    cur.execute("""INSERT INTO transactions (user_id, amount, type, comment)
+                   VALUES (%s, %s, %s, %s)""",
                 (req.user_id, req.delta, "admin_adjust", req.comment))
-    cur.execute("INSERT INTO notifications (user_id, type, title, body) VALUES (%s, %s, %s, %s)",
-                (req.user_id, "admin_message", "Изменение баланса", f"{req.delta:+.0f} ₽ — {req.comment}"))
+    cur.execute("""INSERT INTO notifications (user_id, type, title, body)
+                   VALUES (%s, %s, %s, %s)""",
+                (req.user_id, "admin_message", "Изменение баланса",
+                 f"{req.delta:+.0f} ₽ — {req.comment}"))
     conn.commit()
     return {"ok": True}
 
@@ -519,10 +684,11 @@ def admin_keys(_=Depends(require_admin), conn=Depends(get_db)):
 
 @app.post("/api/admin/keys")
 def admin_add_key(key: str, role: str = "booster", note: str = "",
-                   _=Depends(require_admin), conn=Depends(get_db)):
+                  _=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO keys (key, role, note) VALUES (%s, %s, %s)", (key.upper(), role, note))
+        cur.execute("INSERT INTO keys (key, role, note) VALUES (%s, %s, %s)",
+                    (key.upper(), role, note))
         conn.commit()
         return {"ok": True}
     except psycopg2.IntegrityError:
@@ -546,6 +712,18 @@ def admin_toggle_key(key: str, _=Depends(require_admin), conn=Depends(get_db)):
 def admin_top(_=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
     cur.execute("""SELECT u.id, u.nickname, COALESCE(SUM(t.amount), 0) as earned
-                   FROM users u LEFT JOIN transactions t ON t.user_id = u.id AND t.type = 'earning'
-                   WHERE u.role = 'booster' GROUP BY u.id ORDER BY earned DESC LIMIT 5""")
-    return cur.fetchall()
+                   FROM users u LEFT JOIN transactions t
+                   ON t.user_id = u.id AND t.type = 'earning'
+                   WHERE u.role = 'booster'
+                   GROUP BY u.id ORDER BY earned DESC LIMIT 5""")
+    return rows_to_json(cur.fetchall())
+
+
+@app.get("/api/admin/active-boosts")
+def admin_active_boosts(_=Depends(require_admin), conn=Depends(get_db)):
+    cur = conn.cursor()
+    cur.execute("""SELECT b.*, u.nickname AS booster_nickname
+                   FROM boosts b JOIN users u ON u.id = b.booster_id
+                   WHERE b.status IN ('planned','active')
+                   ORDER BY b.id DESC""")
+    return rows_to_json(cur.fetchall())
