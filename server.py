@@ -1,5 +1,5 @@
 # server.py
-"""Booster Platform API v4 — Neon + Render ready."""
+"""Booster Platform API v5 — Neon + Render ready."""
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
@@ -13,7 +13,7 @@ import asyncio
 import json
 import re
 
-app = FastAPI(title="Valve Games Booster API v4")
+app = FastAPI(title="Valve Games Booster API v5")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -23,6 +23,8 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "TEST-KEY-FOR-ME-0001")
 FACEIT_API_KEY = os.environ.get("FACEIT_API_KEY", "")
 OPENDOTA_BASE = "https://api.opendota.com/api"
 FACEIT_BASE = "https://open.faceit.com/data/v4"
+
+ADVANCE_SHARE = 0.70  # 70% аванс при взятии заказа
 
 
 def get_db():
@@ -91,7 +93,7 @@ class ChatMessage(BaseModel):
 # ==================== БАЗОВЫЕ ====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Booster API v4"}
+    return {"status": "ok", "service": "Booster API v5"}
 
 
 @app.post("/api/login")
@@ -109,11 +111,9 @@ def login(req: LoginRequest, conn=Depends(get_db)):
     user = cur.fetchone()
 
     if user:
-        # ключ уже привязан к этому устройству?
         if user["hwid"] != hwid_hash:
             raise HTTPException(403, "Ключ привязан к другому устройству")
-        # ник привязан к ключу — менять нельзя
-        if req.nickname and req.nickname != user["nickname"]:
+        if req.nickname and req.nickname.strip().lower() != (user["nickname"] or "").lower():
             raise HTTPException(403, "Ник привязан к ключу и не может быть изменён")
         cur.execute("UPDATE users SET last_login = %s WHERE id = %s",
                     (datetime.datetime.now().isoformat(), user["id"]))
@@ -122,7 +122,6 @@ def login(req: LoginRequest, conn=Depends(get_db)):
                 "role": user["role"], "hourly_rate": user["hourly_rate"],
                 "balance": float(user["balance"] or 0)}
 
-    # первый вход — создаём
     if not req.nickname or len(req.nickname.strip()) < 3:
         raise HTTPException(400, "Ник минимум 3 символа")
     nick = req.nickname.strip()
@@ -144,105 +143,248 @@ def login(req: LoginRequest, conn=Depends(get_db)):
 
 
 # ==================== БУСТЫ ====================
+def _next_order_no(cur):
+    """Возвращает следующий 7-значный номер заказа."""
+    cur.execute("SELECT COALESCE(MAX(CAST(order_no AS INTEGER)), 0) + 1 AS nxt FROM boosts")
+    n = int(cur.fetchone()["nxt"])
+    return f"{n:07d}"
+
+
 @app.get("/api/boosts/{user_id}")
-def get_boosts(user_id: int, status: str = "all", conn=Depends(get_db)):
-    """Для бустера — только свои. Для админа — все."""
+def get_boosts(user_id: int, status: str = "all", scope: str = "mine",
+               conn=Depends(get_db)):
+    """
+    scope = "mine"  — мои заказы (где booster_id == user_id)
+    scope = "pool"  — общий пул (planned, никто не взял)
+    scope = "all"   — все (только админ)
+    """
     cur = conn.cursor()
     cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
     row = cur.fetchone()
     is_admin = bool(row and row["role"] == "admin")
 
-    if is_admin:
-        if status == "all":
-            cur.execute("""SELECT b.*, u.nickname AS booster_nickname
-                           FROM boosts b JOIN users u ON u.id = b.booster_id
-                           ORDER BY b.id DESC""")
-        else:
-            cur.execute("""SELECT b.*, u.nickname AS booster_nickname
-                           FROM boosts b JOIN users u ON u.id = b.booster_id
-                           WHERE b.status = %s ORDER BY b.id DESC""", (status,))
-    else:
-        if status == "all":
-            cur.execute("SELECT * FROM boosts WHERE booster_id = %s ORDER BY id DESC",
-                        (user_id,))
-        else:
-            cur.execute("SELECT * FROM boosts WHERE booster_id = %s AND status = %s ORDER BY id DESC",
-                        (user_id, status))
+    where = []
+    params = []
+
+    if scope == "pool":
+        where.append("b.booster_id IS NULL")
+        where.append("b.status = 'planned'")
+    elif scope == "all":
+        if not is_admin:
+            raise HTTPException(403, "Только для админа")
+        if status != "all":
+            where.append("b.status = %s"); params.append(status)
+    else:  # mine
+        where.append("b.booster_id = %s"); params.append(user_id)
+        if status != "all":
+            where.append("b.status = %s"); params.append(status)
+
+    sql = """SELECT b.*, COALESCE(u.nickname, '—') AS booster_nickname
+             FROM boosts b
+             LEFT JOIN users u ON u.id = b.booster_id"""
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY b.id DESC"
+    cur.execute(sql, params)
     return rows_to_json(cur.fetchall())
 
 
 @app.post("/api/boosts")
 def create_boost(boost: BoostCreate, x_user_id: int = Header(...), conn=Depends(get_db)):
+    """Создаёт заказ в общий пул. Создавать может админ или бустер."""
     cur = conn.cursor()
-    cur.execute("""INSERT INTO boosts (booster_id, game, client_steam_id, client_nickname,
-                    start_value, target_value, total_price, commission, booster_earn,
-                    estimated_hours, deadline_days, options, notes)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                (x_user_id, boost.game, boost.client_steam_id, boost.client_nickname,
-                 boost.start_value, boost.target_value, boost.total_price, boost.commission,
-                 boost.booster_earn, boost.estimated_hours, boost.deadline_days,
-                 boost.options, boost.notes))
-    bid = cur.fetchone()["id"]
+    order_no = _next_order_no(cur)
+    cur.execute("""INSERT INTO boosts (order_no, booster_id, game, client_steam_id,
+                    client_nickname, start_value, target_value, total_price,
+                    commission, booster_earn, estimated_hours, deadline_days,
+                    options, notes, status)
+                    VALUES (%s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'planned')
+                    RETURNING id, order_no""",
+                (order_no, boost.game, boost.client_steam_id, boost.client_nickname,
+                 boost.start_value, boost.target_value, boost.total_price,
+                 boost.commission, boost.booster_earn, boost.estimated_hours,
+                 boost.deadline_days, boost.options, boost.notes))
+    r = cur.fetchone()
+    bid = r["id"]; ono = r["order_no"]
     conn.commit()
-    cur.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
-    admin = cur.fetchone()
-    if admin:
+
+    # уведомление всем бустерам
+    cur.execute("SELECT id FROM users WHERE role = 'booster'")
+    for u in cur.fetchall():
         cur.execute("""INSERT INTO notifications (user_id, type, title, body, related_id)
                        VALUES (%s, %s, %s, %s, %s)""",
-                    (admin["id"], "new_boost", f"Новый заказ #{bid}",
-                     f"Игра: {boost.game}, цена: {boost.total_price} ₽", bid))
-        conn.commit()
-    return {"id": bid}
-
-
-@app.post("/api/boosts/{boost_id}/start")
-def start_boost(boost_id: int, conn=Depends(get_db)):
-    cur = conn.cursor()
-    cur.execute("UPDATE boosts SET status = 'active', started_at = %s WHERE id = %s",
-                (datetime.datetime.now().isoformat(), boost_id))
+                    (u["id"], "new_boost", f"Новый заказ #{ono}",
+                     f"{boost.game}: {boost.start_value}→{boost.target_value}", bid))
     conn.commit()
-    return {"ok": True}
+    return {"id": bid, "order_no": ono}
 
 
-@app.post("/api/boosts/{boost_id}/complete")
-def complete_boost(boost_id: int, conn=Depends(get_db)):
+@app.get("/api/boosts/detail/{boost_id}")
+def get_boost_detail(boost_id: int, x_user_id: int = Header(...), conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("SELECT booster_id, booster_earn, commission FROM boosts WHERE id = %s", (boost_id,))
+    cur.execute("""SELECT b.*, COALESCE(u.nickname, '—') AS booster_nickname
+                   FROM boosts b LEFT JOIN users u ON u.id = b.booster_id
+                   WHERE b.id = %s""", (boost_id,))
+    b = cur.fetchone()
+    if not b:
+        raise HTTPException(404, "Заказ не найден")
+
+    cur.execute("SELECT role FROM users WHERE id = %s", (x_user_id,))
+    me = cur.fetchone()
+    is_admin = bool(me and me["role"] == "admin")
+    if not is_admin and b["booster_id"] not in (None, x_user_id):
+        raise HTTPException(403, "Нет доступа")
+
+    cur.execute("""SELECT * FROM transactions WHERE boost_id = %s ORDER BY id DESC""",
+                (boost_id,))
+    txs = rows_to_json(cur.fetchall())
+
+    result = dict(b)
+    for k, v in result.items():
+        if isinstance(v, datetime.datetime):
+            result[k] = v.isoformat()
+    result["transactions"] = txs
+    return result
+
+
+@app.post("/api/boosts/{boost_id}/take")
+def take_boost(boost_id: int, x_user_id: int = Header(...), conn=Depends(get_db)):
+    """Бустер берёт заказ из пула. Сразу аванс 70%."""
+    cur = conn.cursor()
+    cur.execute("""SELECT status, booster_id, booster_earn, order_no
+                   FROM boosts WHERE id = %s""", (boost_id,))
     row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Заказ не найден")
+    if row["booster_id"] is not None:
+        raise HTTPException(400, "Заказ уже взят")
+    if row["status"] != "planned":
+        raise HTTPException(400, "Нельзя взять этот заказ")
+
+    advance = round(float(row["booster_earn"] or 0) * ADVANCE_SHARE, 2)
     now = datetime.datetime.now().isoformat()
-    cur.execute("UPDATE boosts SET status = 'completed', completed_at = %s WHERE id = %s", (now, boost_id))
+
+    cur.execute("""UPDATE boosts SET booster_id = %s, status = 'active',
+                   started_at = %s WHERE id = %s""",
+                (x_user_id, now, boost_id))
     cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s",
-                (row["booster_earn"], row["booster_id"]))
+                (advance, x_user_id))
     cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
                    VALUES (%s, %s, %s, %s, %s)""",
-                (row["booster_id"], boost_id, row["booster_earn"], "earning",
-                 f"Завершён буст #{boost_id}"))
+                (x_user_id, boost_id, advance, "advance",
+                 f"Аванс 70% за взятие заказа #{row['order_no']}"))
+    conn.commit()
+    return {"ok": True, "advance": advance}
+
+
+@app.post("/api/boosts/{boost_id}/complete")
+def complete_boost(boost_id: int, x_user_id: int = Header(...), conn=Depends(get_db)):
+    """Бустер выполнил — ему остаток 30%, заказ закрыт."""
+    cur = conn.cursor()
+    cur.execute("""SELECT booster_id, booster_earn, commission, status, order_no
+                   FROM boosts WHERE id = %s""", (boost_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Заказ не найден")
+    if row["booster_id"] != x_user_id:
+        raise HTTPException(403, "Это не ваш заказ")
+    if row["status"] != "active":
+        raise HTTPException(400, "Заказ не в работе")
+
+    total = float(row["booster_earn"] or 0)
+    advance = round(total * ADVANCE_SHARE, 2)
+    remainder = round(total - advance, 2)
+    now = datetime.datetime.now().isoformat()
+
+    cur.execute("""UPDATE boosts SET status = 'completed', completed_at = %s
+                   WHERE id = %s""", (now, boost_id))
+    if remainder > 0:
+        cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s",
+                    (remainder, x_user_id))
+        cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (x_user_id, boost_id, remainder, "earning",
+                     f"Остаток 30% за заказ #{row['order_no']}"))
+
     cur.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
     admin = cur.fetchone()
     if admin and row["commission"] > 0:
         cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
                        VALUES (%s, %s, %s, %s, %s)""",
                     (admin["id"], boost_id, row["commission"], "commission",
-                     f"Комиссия с буста #{boost_id}"))
+                     f"Комиссия с заказа #{row['order_no']}"))
     conn.commit()
-    return {"ok": True}
+    return {"ok": True, "remainder": remainder}
 
 
 @app.post("/api/boosts/{boost_id}/refund")
-def refund_boost(boost_id: int, conn=Depends(get_db)):
+def refund_boost(boost_id: int, x_user_id: int = Header(...), conn=Depends(get_db)):
+    """Бустер не выполнил — аванс 70% списывается с него и уходит админу."""
     cur = conn.cursor()
-    cur.execute("UPDATE boosts SET status = 'refunded', completed_at = %s WHERE id = %s",
-                (datetime.datetime.now().isoformat(), boost_id))
+    cur.execute("""SELECT booster_id, booster_earn, status, order_no
+                   FROM boosts WHERE id = %s""", (boost_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Заказ не найден")
+    if row["booster_id"] != x_user_id:
+        raise HTTPException(403, "Это не ваш заказ")
+    if row["status"] != "active":
+        raise HTTPException(400, "Нельзя вернуть этот заказ")
+
+    advance = round(float(row["booster_earn"] or 0) * ADVANCE_SHARE, 2)
+    now = datetime.datetime.now().isoformat()
+
+    cur.execute("""UPDATE boosts SET status = 'refunded', completed_at = %s
+                   WHERE id = %s""", (now, boost_id))
+    cur.execute("UPDATE users SET balance = balance - %s WHERE id = %s",
+                (advance, x_user_id))
+    cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (x_user_id, boost_id, -advance, "refund",
+                 f"Возврат аванса за заказ #{row['order_no']}"))
+
+    cur.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
+    admin = cur.fetchone()
+    if admin:
+        cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s",
+                    (advance, admin["id"]))
+        cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (admin["id"], boost_id, advance, "refund_in",
+                     f"Возврат с заказа #{row['order_no']}"))
     conn.commit()
-    return {"ok": True}
+    return {"ok": True, "refunded": advance}
+
+
+@app.delete("/api/boosts/{boost_id}")
+def delete_boost(boost_id: int, x_user_id: int = Header(...), conn=Depends(get_db)):
+    """Удалить заказ можно только пока он в пуле (никто не взял)."""
+    cur = conn.cursor()
+    cur.execute("SELECT booster_id, status, order_no FROM boosts WHERE id = %s",
+                (boost_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Заказ не найден")
+    if row["booster_id"] is not None or row["status"] != "planned":
+        raise HTTPException(400, "Нельзя удалить взятый заказ")
+
+    cur.execute("SELECT role FROM users WHERE id = %s", (x_user_id,))
+    me = cur.fetchone()
+    is_admin = bool(me and me["role"] == "admin")
+    if not is_admin:
+        # бустеру удалять чужие пуловые заказы нельзя — только админ
+        raise HTTPException(403, "Только админ может удалять заказы")
+
+    cur.execute("DELETE FROM boosts WHERE id = %s", (boost_id,))
+    conn.commit()
+    return {"ok": True, "order_no": row["order_no"]}
 
 
 @app.post("/api/boosts/transfer")
 def transfer_boost(req: TransferBoost, x_user_id: int = Header(...), conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("SELECT booster_id, status FROM boosts WHERE id = %s", (req.boost_id,))
+    cur.execute("SELECT booster_id, status, order_no FROM boosts WHERE id = %s",
+                (req.boost_id,))
     row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Заказ не найден")
@@ -252,7 +394,6 @@ def transfer_boost(req: TransferBoost, x_user_id: int = Header(...), conn=Depend
     cur.execute("SELECT role, nickname FROM users WHERE id = %s", (x_user_id,))
     me = cur.fetchone()
     is_admin = bool(me and me["role"] == "admin")
-
     if not is_admin and row["booster_id"] != x_user_id:
         raise HTTPException(403, "Можно передавать только свои заказы")
 
@@ -261,12 +402,33 @@ def transfer_boost(req: TransferBoost, x_user_id: int = Header(...), conn=Depend
     if not target:
         raise HTTPException(404, "Получатель не найден")
 
+    # если передаём уже взятый заказ — аванс списывается с прошлого бустера и начисляется новому
+    old_booster = row["booster_id"]
+    if old_booster and row["status"] == "active":
+        cur.execute("SELECT booster_earn FROM boosts WHERE id = %s", (req.boost_id,))
+        earn = float(cur.fetchone()["booster_earn"] or 0)
+        advance = round(earn * ADVANCE_SHARE, 2)
+
+        cur.execute("UPDATE users SET balance = balance - %s WHERE id = %s",
+                    (advance, old_booster))
+        cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (old_booster, req.boost_id, -advance, "transfer_out",
+                     f"Передача заказа #{row['order_no']}"))
+
+        cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s",
+                    (advance, req.to_user_id))
+        cur.execute("""INSERT INTO transactions (user_id, boost_id, amount, type, comment)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (req.to_user_id, req.boost_id, advance, "transfer_in",
+                     f"Принят заказ #{row['order_no']}"))
+
     cur.execute("UPDATE boosts SET booster_id = %s WHERE id = %s",
                 (req.to_user_id, req.boost_id))
     cur.execute("""INSERT INTO notifications (user_id, type, title, body, related_id)
                    VALUES (%s, 'transfer', 'Вам передан заказ', %s, %s)""",
                 (req.to_user_id,
-                 f"Заказ #{req.boost_id} передан от {me['nickname']}",
+                 f"Заказ #{row['order_no']} передан от {me['nickname']}",
                  req.boost_id))
     conn.commit()
     return {"ok": True}
@@ -289,7 +451,8 @@ def get_profile(user_id: int, conn=Depends(get_db)):
         FROM boosts WHERE booster_id = %s""", (user_id,))
     counts = cur.fetchone()
 
-    cur.execute("SELECT COALESCE(SUM(amount), 0) as earned FROM transactions WHERE user_id = %s AND type = 'earning'", (user_id,))
+    cur.execute("""SELECT COALESCE(SUM(amount), 0) AS earned FROM transactions
+                   WHERE user_id = %s AND type IN ('earning','advance')""", (user_id,))
     total_earned = cur.fetchone()["earned"]
 
     today = datetime.date.today().isoformat()
@@ -300,7 +463,7 @@ def get_profile(user_id: int, conn=Depends(get_db)):
         COALESCE(SUM(CASE WHEN date(date) = %s THEN amount END), 0) as today,
         COALESCE(SUM(CASE WHEN date(date) >= %s THEN amount END), 0) as week,
         COALESCE(SUM(CASE WHEN date(date) >= %s THEN amount END), 0) as month
-        FROM transactions WHERE user_id = %s AND type = 'earning'""",
+        FROM transactions WHERE user_id = %s AND type IN ('earning','advance')""",
         (today, week_ago, month_ago, user_id))
     periods = cur.fetchone()
 
@@ -325,7 +488,8 @@ def get_profile(user_id: int, conn=Depends(get_db)):
     for i in range(13, -1, -1):
         d = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
         cur.execute("""SELECT COALESCE(SUM(amount), 0) as s
-                       FROM transactions WHERE user_id = %s AND type = 'earning'
+                       FROM transactions WHERE user_id = %s
+                       AND type IN ('earning','advance')
                        AND date(date) = %s""", (user_id, d))
         daily.append({"date": d, "amount": float(cur.fetchone()["s"] or 0)})
 
@@ -423,7 +587,7 @@ def unread_count(user_id: int, conn=Depends(get_db)):
     return {"count": cur.fetchone()["c"]}
 
 
-# ==================== АНАЛИЗ КЛИЕНТА (DOTA) ====================
+# ==================== АНАЛИЗ (DOTA) ====================
 def _get_cache(steam32, conn):
     cur = conn.cursor()
     cur.execute("SELECT * FROM client_cache WHERE steam32_id = %s", (steam32,))
@@ -460,7 +624,6 @@ async def _http_get(url, timeout=6):
 
 
 async def _analyze_dota_internal(steam32, conn):
-    # 1) кэш
     cached = _get_cache(steam32, conn)
     if cached:
         age = (datetime.datetime.now() - cached["updated_at"]).total_seconds()
@@ -473,7 +636,6 @@ async def _analyze_dota_internal(steam32, conn):
             result["from_cache"] = True
             return result
 
-    # 2) три параллельных запроса вместо пяти
     profile, recent, first = await asyncio.gather(
         _http_get(f"{OPENDOTA_BASE}/players/{steam32}"),
         _http_get(f"{OPENDOTA_BASE}/players/{steam32}/recentMatches"),
@@ -547,10 +709,9 @@ async def analyze_client(steam32: str, conn=Depends(get_db)):
         return {"error": "OpenDota не ответил за 8 секунд"}
 
 
-# ==================== АНАЛИЗ КЛИЕНТА (CS2 / FACEIT) ====================
+# ==================== АНАЛИЗ (CS2 / FACEIT) ====================
 @app.get("/api/client/analyze-cs2/{steam_id}")
 async def analyze_cs2(steam_id: str):
-    """Анализ CS2 через FACEIT Data API v4."""
     if not FACEIT_API_KEY:
         return {"error": "FACEIT_API_KEY не настроен"}
     headers = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
@@ -565,7 +726,6 @@ async def analyze_cs2(steam_id: str):
             pid = player.get("player_id")
             if not pid:
                 return {"error": "Не удалось найти игрока на FACEIT"}
-
             stats_r = await c.get(f"{FACEIT_BASE}/players/{pid}/stats/cs2",
                                   headers=headers)
             stats = stats_r.json() if stats_r.status_code == 200 else {}
@@ -713,7 +873,7 @@ def admin_top(_=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
     cur.execute("""SELECT u.id, u.nickname, COALESCE(SUM(t.amount), 0) as earned
                    FROM users u LEFT JOIN transactions t
-                   ON t.user_id = u.id AND t.type = 'earning'
+                   ON t.user_id = u.id AND t.type IN ('earning','advance')
                    WHERE u.role = 'booster'
                    GROUP BY u.id ORDER BY earned DESC LIMIT 5""")
     return rows_to_json(cur.fetchall())
@@ -722,48 +882,15 @@ def admin_top(_=Depends(require_admin), conn=Depends(get_db)):
 @app.get("/api/admin/active-boosts")
 def admin_active_boosts(_=Depends(require_admin), conn=Depends(get_db)):
     cur = conn.cursor()
-    cur.execute("""SELECT b.*, u.nickname AS booster_nickname
-                   FROM boosts b JOIN users u ON u.id = b.booster_id
+    cur.execute("""SELECT b.*, COALESCE(u.nickname, '—') AS booster_nickname
+                   FROM boosts b LEFT JOIN users u ON u.id = b.booster_id
                    WHERE b.status IN ('planned','active')
                    ORDER BY b.id DESC""")
     return rows_to_json(cur.fetchall())
 
-# ==================== ДОП. АДМИН-ЭНДПОИНТЫ ====================
-
-@app.get("/api/boosts/detail/{boost_id}")
-def get_boost_detail(boost_id: int, x_user_id: int = Header(...), conn=Depends(get_db)):
-    """Детальная инфа по одному заказу + кто работает + история."""
-    cur = conn.cursor()
-    cur.execute("""SELECT b.*, u.nickname AS booster_nickname, u.id AS booster_user_id
-                   FROM boosts b JOIN users u ON u.id = b.booster_id
-                   WHERE b.id = %s""", (boost_id,))
-    b = cur.fetchone()
-    if not b:
-        raise HTTPException(404, "Заказ не найден")
-
-    # права: только сам бустер или админ
-    cur.execute("SELECT role FROM users WHERE id = %s", (x_user_id,))
-    me = cur.fetchone()
-    is_admin = bool(me and me["role"] == "admin")
-    if not is_admin and b["booster_id"] != x_user_id:
-        raise HTTPException(403, "Нет доступа")
-
-    # транзакции по заказу
-    cur.execute("""SELECT * FROM transactions WHERE boost_id = %s
-                   ORDER BY id DESC""", (boost_id,))
-    txs = rows_to_json(cur.fetchall())
-
-    result = dict(b)
-    for k, v in result.items():
-        if isinstance(v, datetime.datetime):
-            result[k] = v.isoformat()
-    result["transactions"] = txs
-    return result
-
 
 @app.get("/api/admin/boosters-stats")
 def admin_boosters_stats(_=Depends(require_admin), conn=Depends(get_db)):
-    """Сводка по каждому бустеру + админ."""
     cur = conn.cursor()
     cur.execute("""SELECT id, nickname, role, balance, hourly_rate, last_login
                    FROM users ORDER BY role DESC, id ASC""")
@@ -787,20 +914,13 @@ def admin_boosters_stats(_=Depends(require_admin), conn=Depends(get_db)):
                     (u["id"],))
         comm = float(cur.fetchone()["commission"] or 0)
         out.append({
-            "id": u["id"],
-            "nickname": u["nickname"],
-            "role": u["role"],
+            "id": u["id"], "nickname": u["nickname"], "role": u["role"],
             "balance": float(u["balance"] or 0),
-            "hourly_rate": u["hourly_rate"],
-            "last_login": u["last_login"],
-            "planned": s["planned"],
-            "active": s["active"],
-            "completed": s["completed"],
-            "refunded": s["refunded"],
-            "earned": earned,
-            "avg_check": float(s["avg_check"] or 0),
-            "hours": hours,
-            "avg_hourly": (earned / hours) if hours else 0,
+            "hourly_rate": u["hourly_rate"], "last_login": u["last_login"],
+            "planned": s["planned"], "active": s["active"],
+            "completed": s["completed"], "refunded": s["refunded"],
+            "earned": earned, "avg_check": float(s["avg_check"] or 0),
+            "hours": hours, "avg_hourly": (earned / hours) if hours else 0,
             "commission": comm,
         })
     return out
