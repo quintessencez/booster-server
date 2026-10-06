@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+psycopg2-binary
+pydantic
+httpx
+cryptography
+requests
+beautifulsoup4
+lxml
+requests-toolbelt

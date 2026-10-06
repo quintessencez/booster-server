@@ -1,0 +1,16 @@
+# Secrets / local configuration
+.env
+.env.*
+!/.env.example
+READY_CONFIG.txt
+RENDER_ENV_VALUES.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
