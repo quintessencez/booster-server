@@ -47,8 +47,8 @@ MASTER_ADMIN_KEY = ADMIN_KEY
 FUNPAY_TOKEN_SECRET = os.environ.get("FUNPAY_TOKEN_SECRET", ADMIN_KEY)
 FUNPAY_FERNET = Fernet(urlsafe_b64encode(hashlib.sha256(FUNPAY_TOKEN_SECRET.encode()).digest()))
 FUNPAY_PUBLIC_CHATS = {
-    "dota2": {"name": "🎮 Dota 2 — общий чат", "chat_id": os.environ.get("FUNPAY_DOTA_CHAT_ID", "").strip()},
-    "cs2": {"name": "🔫 CS2 — общий чат", "chat_id": os.environ.get("FUNPAY_CS2_CHAT_ID", "").strip()},
+    "dota2": {"name": "🎮 Dota 2 — общий чат", "chat_id": os.environ.get("FUNPAY_DOTA_CHAT_ID", "game-41").strip()},
+    "cs2": {"name": "🔫 CS2 — общий чат", "chat_id": os.environ.get("FUNPAY_CS2_CHAT_ID", "game-333").strip()},
 }
 
 # Доля исполнителя для обычных заказов зависит от серверного уровня.
