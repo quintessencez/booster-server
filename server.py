@@ -955,10 +955,19 @@ def funpay_pricing(current_mmr:int,target_mmr:int=0,game:str="Dota 2",x_user_id:
     return {"source":"funpay_lot","matched_lot":selected,"price_per_win":round(ppw,2),"unit_mmr":unit,"lots":lots}
 
 @app.get("/api/funpay")
-def funpay_status(x_user_id:int=Header(...),conn=Depends(get_db)):
-    cur=conn.cursor(); cur.execute("SELECT id,funpay_username,funpay_connected,funpay_connected_at FROM funpay_accounts WHERE user_id=%s",(x_user_id,)); row=cur.fetchone()
-    if not row: return {"connected":False}
-    return dict(row)
+def funpay_status(x_user_id: int = Header(...), conn=Depends(get_db)):
+    cur = conn.cursor()
+    cur.execute("""SELECT funpay_username, funpay_connected, funpay_connected_at
+                   FROM funpay_accounts WHERE user_id = %s""", (x_user_id,))
+    row = cur.fetchone()
+    if not row or not row.get("funpay_connected"):
+        return {"connected": False}
+    connected_at = row.get("funpay_connected_at")
+    return {
+        "connected": True,
+        "funpay_username": row.get("funpay_username") or "FunPay",
+        "funpay_connected_at": connected_at.isoformat() if connected_at else None,
+    }
 
 @app.post("/api/funpay/connect")
 def funpay_connect(req:FunPayConnect,x_user_id:int=Header(...),conn=Depends(get_db)):
