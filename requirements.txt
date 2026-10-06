@@ -2,3 +2,4 @@ fastapi
 uvicorn
 psycopg2-binary
 httpx
+FunPayAPI==1.1.0
