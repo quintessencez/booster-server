@@ -622,23 +622,41 @@ def _funpay_public_key_from_db_id(value):
 
 
 def _funpay_get_session(account):
-    """Пробуем достать requests.Session из Account FunPayAPI (атрибут меняется между версиями)."""
-    for attr in ("session", "_FunPayAccount__session", "_session", "runner"):
-        obj = getattr(account, attr, None)
-        if obj is None:
-            continue
-        sess = getattr(obj, "session", obj)
-        if sess is not None and hasattr(sess, "get") and hasattr(sess, "post"):
-            return sess
-    # Фолбэк — перебор всех атрибутов
-    for name in dir(account):
+    """Создаём requests.Session вручную с golden_key из объекта Account."""
+    import requests
+    # Достаём golden_key из атрибутов аккаунта
+    token = None
+    for attr in ("golden_key", "_golden_key", "token", "_FunPayAccount__golden_key"):
+        v = getattr(account, attr, None)
+        if isinstance(v, str) and len(v) >= 16:
+            token = v
+            break
+    # Если в account токен не лежит — берём из БД
+    if not token:
         try:
-            obj = getattr(account, name)
-            if hasattr(obj, "get") and hasattr(obj, "post") and hasattr(obj, "cookies"):
-                return obj
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT golden_key FROM funpay_accounts WHERE funpay_connected=TRUE LIMIT 1")
+                row = cur.fetchone()
+                if row:
+                    token = decrypt_funpay_token(row["golden_key"])
+            finally:
+                conn.close()
         except Exception:
-            continue
-    return None
+            token = None
+    if not token:
+        return None
+    s = requests.Session()
+    s.cookies.set("golden_key", token, domain=".funpay.com")
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Referer": "https://funpay.com/",
+    })
+    return s
 
 
 # ---------- HTML-ПАРСЕР ЛИЧНЫХ КОНТАКТОВ ----------
